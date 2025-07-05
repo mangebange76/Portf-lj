@@ -1,113 +1,91 @@
 import streamlit as st
-import pandas as pd
-import yfinance as yf
-import datetime
 import gspread
 from google.oauth2.service_account import Credentials
-from forex_python.converter import CurrencyRates
+import pandas as pd
+from datetime import datetime
+import requests
 
-# --- Autentisering mot Google Sheets ---
+st.set_page_config(page_title="Portföljöversikt", layout="wide")
+
+# 🔐 Autentisering med Google Sheets
 scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
 
-# --- Inställningar ---
+# 🔗 Länk till ditt Google Sheet
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1SmX-5TU1cPN2K8eLKGTGkCPeqj3J-89nuT9zKlI2_sY/edit"
-SHEET_NAME = "Portfölj"
+SHEET_ID = SHEET_URL.split("/d/")[1].split("/")[0]
 
-# --- Ladda arket ---
-def load_data():
-    spreadsheet = client.open_by_url(SHEET_URL)
-    try:
-        worksheet = spreadsheet.worksheet(SHEET_NAME)
-    except:
-        worksheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows="1000", cols="20")
-        worksheet.append_row(["Bolag", "Ticker", "Antal", "Valuta", "Kategori", "Målvikt (%)", "Tillväxt (%)", "P/S TTM"])
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data), worksheet
-
-# --- Hämta valutakurser ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)  # cacha i 24 timmar
 def get_exchange_rates():
-    c = CurrencyRates()
-    return {
-        "USD": c.get_rate("USD", "SEK"),
-        "NOK": c.get_rate("NOK", "SEK"),
-        "CAD": c.get_rate("CAD", "SEK"),
-        "SEK": 1.0
-    }
-
-# --- Hämta aktiekurser ---
-@st.cache_data(ttl=600)
-def get_price(ticker):
+    url = "https://api.exchangerate.host/latest?base=USD"
     try:
-        info = yf.Ticker(ticker).info
-        return info.get("regularMarketPrice", 0)
+        response = requests.get(url)
+        data = response.json()
+        return {
+            "USDSEK": data["rates"]["SEK"],
+            "CADSEK": data["rates"]["SEK"] / data["rates"]["CAD"],
+            "NOKSEK": data["rates"]["SEK"] / data["rates"]["NOK"],
+        }
     except:
-        return 0
+        st.warning("Kunde inte hämta aktuella valutakurser. Visar förinställda värden.")
+        return {
+            "USDSEK": 10.50,
+            "CADSEK": 7.80,
+            "NOKSEK": 1.00,
+        }
 
-# --- Hämta utdelningar ---
-@st.cache_data(ttl=3600)
-def get_dividends(ticker):
-    try:
-        div = yf.Ticker(ticker).dividends
-        upcoming = div[div.index > datetime.datetime.now() - datetime.timedelta(days=5)]
-        return upcoming
-    except:
-        return pd.Series()
+def load_data():
+    spreadsheet = client.open_by_key(SHEET_ID)
+    worksheet = spreadsheet.sheet1
+    data = worksheet.get_all_records()
+    df = pd.DataFrame(data)
+    return df, worksheet
 
-# --- Räkna portfölj och köp-rek ---
-def calculate(df, kapital, rates):
-    total_value = 0
-    bolag_data = []
+def calculate_portfolio_value(df, exchange_rates):
+    df["Valutakurs"] = df["Valuta"].map({
+        "USD": exchange_rates["USDSEK"],
+        "NOK": exchange_rates["NOKSEK"],
+        "CAD": exchange_rates["CADSEK"]
+    })
+    df["Värde SEK"] = df["Antal"] * df["Kurs"] * df["Valutakurs"]
+    total = df["Värde SEK"].sum()
+    return df, total
 
-    for _, row in df.iterrows():
-        ticker, antal, valuta = row["Ticker"], row["Antal"], row["Valuta"]
-        pris = get_price(ticker)
-        kurs_sek = pris * rates.get(valuta, 1)
-        värde = antal * kurs_sek
-        total_value += värde
-        bolag_data.append({**row, "Kurs SEK": kurs_sek, "Värde": värde})
-
-    portfölj_df = pd.DataFrame(bolag_data)
-    portfölj_df["Vikt (%)"] = (portfölj_df["Värde"] / total_value * 100).round(2)
-    portfölj_df["Undervikt (%)"] = (portfölj_df["Målvikt (%)"] - portfölj_df["Vikt (%)"]).round(2)
-    portfölj_df["Köp (SEK)"] = ((portfölj_df["Undervikt (%)"] / 100) * (total_value + kapital)).round(0)
-
-    return portfölj_df, total_value
-
-# --- Visa appen ---
 def main():
-    st.set_page_config(page_title="Portföljanalys", layout="centered")
-    st.title("📊 Din Portföljöversikt")
-
-    kapital = st.number_input("💰 Tillgängligt kapital (SEK):", min_value=0, step=100, value=1000, key="kapital")
-
+    st.title("📈 Portföljöversikt – tillväxt & utdelning")
     df, worksheet = load_data()
-    rates = get_exchange_rates()
-    portfölj_df, total_value = calculate(df, kapital, rates)
+    exchange_rates = get_exchange_rates()
 
-    st.subheader("📦 Totalt portföljvärde:")
-    st.metric(label="Portföljvärde i SEK", value=f"{int(total_value):,} kr".replace(",", " "))
+    df, total_value = calculate_portfolio_value(df, exchange_rates)
 
-    st.subheader("🛍️ Investeringsförslag")
-    köp_df = portfölj_df.sort_values("Undervikt (%)", ascending=False).head(5)
-    st.dataframe(köp_df[["Bolag", "Ticker", "Undervikt (%)", "Köp (SEK)"]])
+    st.subheader("Nuvarande innehav")
+    st.dataframe(df[["Bolag", "Ticker", "Antal", "Valuta", "Kurs", "Värde SEK"]])
 
-    st.subheader("📈 Portföljinnehav")
-    st.dataframe(portfölj_df[["Bolag", "Ticker", "Antal", "Kurs SEK", "Värde", "Vikt (%)", "Målvikt (%)"]])
+    st.markdown(f"**Totalt portföljvärde:** `{total_value:,.0f}` SEK")
 
-    st.subheader("💸 Utdelningsprognos (kommande)")
-    total_div = 0
-    for _, row in df.iterrows():
-        ticker, antal = row["Ticker"], row["Antal"]
-        div = get_dividends(ticker)
-        if not div.empty:
-            senaste = div.tail(1)
-            if not senaste.empty:
-                värde = senaste.values[0] * antal * rates.get(row["Valuta"], 1)
-                total_div += värde
-    st.write(f"📅 Bekräftade utdelningar denna månad: **{round(total_div)} kr**")
+    with st.expander("➕ Lägg till nytt innehav"):
+        with st.form("add_form", clear_on_submit=True):
+            bolag = st.text_input("Bolag")
+            ticker = st.text_input("Ticker")
+            antal = st.number_input("Antal aktier", min_value=0)
+            valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD"])
+            kurs = st.number_input("Aktuell kurs", min_value=0.0)
+            submit = st.form_submit_button("Lägg till")
+            if submit and bolag and ticker and antal > 0 and kurs > 0:
+                ny_rad = [bolag, ticker, antal, valuta, kurs]
+                worksheet.append_row(ny_rad)
+                st.success("Innehavet har lagts till.")
+                st.stop()
+
+    with st.expander("🗑️ Ta bort bolag"):
+        namnlista = df["Bolag"].tolist()
+        val = st.selectbox("Välj bolag att ta bort", namnlista)
+        if st.button("Ta bort"):
+            index = df[df["Bolag"] == val].index[0]
+            worksheet.delete_rows(index + 2)
+            st.success(f"{val} har tagits bort.")
+            st.stop()
 
 if __name__ == "__main__":
     main()
