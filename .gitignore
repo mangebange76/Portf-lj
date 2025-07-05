@@ -1,0 +1,13 @@
+# Ignorera Python-cachefiler
+__pycache__/
+*.py[cod]
+
+# Ignorera miljöfiler
+.env
+secrets.toml
+
+# Ignorera Streamlit-mapp
+.streamlit/
+
+# Ignorera övriga systemfiler
+.DS_Store
