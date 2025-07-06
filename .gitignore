@@ -1,13 +1,10 @@
-# Ignorera Python-cachefiler
+# Python
 __pycache__/
 *.py[cod]
+*.env
 
-# Ignorera miljöfiler
-.env
-secrets.toml
+# Streamlit secrets
+.secrets.toml
 
-# Ignorera Streamlit-mapp
-.streamlit/
-
-# Ignorera övriga systemfiler
+# Mac
 .DS_Store
