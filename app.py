@@ -2,19 +2,20 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-import json
-import requests
 from datetime import datetime
-from forex_python.converter import CurrencyRates
+import requests
+import json
 
-# Anslut till Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets",
-         "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.file"]
-credentials = Credentials.from_service_account_info(
-    json.loads(st.secrets["GOOGLE_CREDENTIALS"]), scopes=scope)
+# Konfiguration
+st.set_page_config(page_title="Portföljanalys", layout="wide")
+
+# Autentisering
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1SmX-5TU1cPN2K8eLKGTGkCPeqj3J-89nuT9zKlI2_sY/edit?usp=drivesdk"
+# Ladda kalkylblad
+SHEET_URL = st.secrets["SHEET_URL"]
 
 def load_data():
     spreadsheet = client.open_by_url(SHEET_URL)
@@ -23,76 +24,149 @@ def load_data():
     df = pd.DataFrame(data)
     return df, worksheet
 
-def fetch_exchange_rates():
+# Hämta valutakurser
+def get_exchange_rates():
     try:
-        c = CurrencyRates()
+        res = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=SEK,CAD,NOK")
+        rates = res.json()["rates"]
         return {
-            "USD": c.get_rate("USD", "SEK"),
-            "NOK": c.get_rate("NOK", "SEK"),
-            "CAD": c.get_rate("CAD", "SEK")
+            "USD": 1,
+            "SEK": rates.get("SEK", 10.5),
+            "NOK": rates.get("NOK", 1.0),
+            "CAD": rates.get("CAD", 1.0),
         }
-    except:
+    except Exception:
         st.warning("Kunde inte hämta aktuella valutakurser. Visar förinställda värden.")
-        return {"USD": 10.0, "NOK": 1.0, "CAD": 7.5}
+        return {"USD": 1, "SEK": 10.5, "NOK": 1, "CAD": 1}
 
+# Beräkna portföljvärde
 def calculate_portfolio_value(df, exchange_rates):
-    df["Valutakurs"] = df["Valuta"].map(exchange_rates)
+    df["Valutakurs"] = df["Valuta"].map(exchange_rates).fillna(1)
     df["Värde SEK"] = df["Antal"] * df["Kurs"] * df["Valutakurs"]
     total_value = df["Värde SEK"].sum()
     return df, total_value
 
-def show_summary(df, total_value):
-    st.header("📊 Sammanfattning")
+# Utdelningsprognos (månatlig summering)
+def calculate_dividend_projection(df):
+    today = datetime.today()
+    df["Kommande utdelning"] = pd.to_datetime(df["Utdelningsdatum"], errors='coerce')
+    df["Utdelning väntad"] = df.apply(
+        lambda row: row["Antal"] * row["Utdelning per aktie"] if row["Kommande utdelning"] and row["Kommande utdelning"] >= today else 0,
+        axis=1,
+    )
+    df["Månad"] = df["Kommande utdelning"].dt.strftime("%Y-%m")
+    månadsvis = df.groupby("Månad")["Utdelning väntad"].sum().reset_index()
+    månadsvis = månadsvis[månadsvis["Utdelning väntad"] > 0]
+    total_kommande = df["Utdelning väntad"].sum()
+    return månadsvis, total_kommande
+
+def visa_portfolio(df, total_value, månadsvis, total_kommande):
+    st.header("📊 Portföljöversikt")
     st.metric("Totalt portföljvärde (SEK)", f"{total_value:,.0f} kr")
-    grouped = df.groupby("Kategori")["Värde SEK"].sum()
-    for kategori, värde in grouped.items():
-        procent = värde / total_value * 100
-        st.write(f"- **{kategori}**: {värde:,.0f} kr ({procent:.1f}%)")
 
-def edit_holdings(df, worksheet):
-    st.header("✏️ Redigera innehav")
-    index = st.selectbox("Välj rad att redigera", df.index)
-    row = df.loc[index]
-    with st.form(key="edit_form"):
-        antal = st.number_input("Antal", value=row["Antal"])
-        kurs = st.number_input("Senaste kurs", value=row["Kurs"])
-        submitted = st.form_submit_button("Spara ändringar")
-        if submitted:
-            worksheet.update_cell(index + 2, df.columns.get_loc("Antal") + 1, antal)
-            worksheet.update_cell(index + 2, df.columns.get_loc("Kurs") + 1, kurs)
-            st.success("Uppdaterat! Ladda om sidan för att se ändringarna.")
+    st.dataframe(df[["Bolag", "Ticker", "Antal", "Kurs", "Valuta", "Värde SEK"]].sort_values(by="Värde SEK", ascending=False), use_container_width=True)
 
-def add_transaction(worksheet, df):
-    st.header("➕ Lägg till nytt innehav")
-    with st.form(key="add_form"):
-        namn = st.text_input("Bolagsnamn")
-        ticker = st.text_input("Ticker")
-        antal = st.number_input("Antal", min_value=0)
-        valuta = st.selectbox("Valuta", ["USD", "NOK", "CAD"])
-        kurs = st.number_input("Senaste kurs")
-        kategori = st.selectbox("Kategori", ["Tillväxt", "Utdelning", "Övrigt"])
-        submitted = st.form_submit_button("Lägg till")
-        if submitted and namn:
-            ny_rad = [namn, ticker, antal, valuta, kurs, kategori]
-            worksheet.append_row(ny_rad)
-            st.success("Innehavet har lagts till!")
+    st.markdown("---")
+    st.subheader("📆 Prognos: Kommande utdelningar")
 
+    if månadsvis.empty:
+        st.info("Inga bekräftade framtida utdelningar just nu.")
+    else:
+        st.dataframe(månadsvis.rename(columns={
+            "Månad": "Utdelningsmånad",
+            "Utdelning väntad": "Förväntad utdelning (SEK)"
+        }), use_container_width=True)
+
+        st.metric("Totalt väntad utdelning", f"{total_kommande:,.0f} kr")
+
+            idx = df[df["Ticker"] == ticker].index[0] + 2  # +2 för att hoppa header och 0-index
+            for i, key in enumerate(["Bolag", "Ticker", "Valuta", "Antal", "Kurs", "Utdelning", "Månad"]):
+                worksheet.update_cell(idx, i + 1, ny_rad[key])
+            st.success("Innehavet uppdaterat!")
+        else:
+            st.error("Ticker kunde inte matchas med någon befintlig rad.")
+    else:
+        st.warning("Fyll i alla fält korrekt för att uppdatera ett innehav.")
+
+def visa_utdelningsprognos(df):
+    st.subheader("📅 Kommande utdelningar")
+
+    df["Månad"] = df["Månad"].astype(str).str.strip()
+    aktuell_månad = str(datetime.now().month)
+    kommande = df[df["Månad"] == aktuell_månad]
+
+    if not kommande.empty:
+        kommande["Utdelning totalt"] = kommande["Utdelning"] * kommande["Antal"] * kommande["Valutakurs"]
+        total = kommande["Utdelning totalt"].sum()
+        st.dataframe(kommande[["Bolag", "Ticker", "Utdelning totalt"]])
+        st.markdown(f"**Totalt förväntad utdelning denna månad:** `{total:.2f} SEK`")
+    else:
+        st.info("Inga utdelningar planerade för denna månad.")
+
+def spara_utdelningshistorik(df, worksheet):
+    månad = datetime.now().month
+    år = datetime.now().year
+    total = (df[df["Månad"] == månad]["Utdelning"] * df["Antal"] * df["Valutakurs"]).sum()
+    
+    # Kolumn Z och rad efter år - 2024 + 2 (förskjutet från rad 2)
+    rad = år - 2024 + 2
+    worksheet.update_acell(f'Z{rad}', total)
+
+def visa_utdelningshistorik(worksheet):
+    st.subheader("📈 Utdelningshistorik")
+
+    data = worksheet.get_all_values()
+    header = data[0]
+    rows = data[1:]
+    år_col = [row[0] for row in rows]
+    utdelning_col = [row[25] if len(row) > 25 else "" for row in rows]  # Kolumn Z = index 25
+
+    historik = pd.DataFrame({
+        "År": år_col,
+        "Total utdelning (SEK)": utdelning_col
+    })
+
+    historik = historik[historik["År"].str.isnumeric()]
+    historik["År"] = historik["År"].astype(int)
+    historik["Total utdelning (SEK)"] = pd.to_numeric(historik["Total utdelning (SEK)"], errors="coerce")
+    historik = historik.dropna()
+
+    if not historik.empty:
+        st.bar_chart(historik.set_index("År"))
+    else:
+        st.info("Ingen utdelningshistorik sparad än.")
+
+# HUVUDFUNKTION
 def main():
-    st.title("📈 Min Aktieportfölj")
-    exchange_rates = fetch_exchange_rates()
+    st.title("📊 Aktieportfölj och Utdelningsspårning")
+    
+    try:
+        exchange_rates = get_exchange_rates()
+    except:
+        exchange_rates = {"USD": 10.0, "EUR": 11.0}
+        st.warning("Kunde inte hämta aktuella valutakurser. Visar förinställda värden.")
+
     df, worksheet = load_data()
+    df = uppdatera_valutakurs(df, exchange_rates)
     df, total_value = calculate_portfolio_value(df, exchange_rates)
 
-    st.sidebar.header("Navigering")
-    sida = st.sidebar.radio("Gå till", ["Översikt", "Redigera innehav", "Lägg till innehav"])
+    with st.expander("📌 Nuvarande innehav"):
+        visa_tabell(df, total_value)
 
-    if sida == "Översikt":
-        show_summary(df, total_value)
-        st.dataframe(df)
-    elif sida == "Redigera innehav":
-        edit_holdings(df, worksheet)
-    elif sida == "Lägg till innehav":
-        add_transaction(worksheet, df)
+    st.markdown("---")
+    st.header("➕ Lägg till nytt innehav")
+    lägg_till_innehav(df, worksheet)
+
+    st.markdown("---")
+    st.header("✏️ Redigera innehav")
+    redigera_innehav(df, worksheet)
+
+    st.markdown("---")
+    visa_utdelningsprognos(df)
+    spara_utdelningshistorik(df, worksheet)
+
+    st.markdown("---")
+    visa_utdelningshistorik(worksheet)
 
 if __name__ == "__main__":
     main()
